@@ -1,0 +1,686 @@
+<html>
+	<head>
+		<title>CAP 6721 Joseph Sarabia</title>
+		<script type="text/javascript" src="main.js"></script>
+ 		<script type="text/javascript" src="gl-matrix.js"></script>
+ 		<script type="text/javascript" src="scene1.js"></script>
+	</head>
+	<body onLoad="main()">
+		<script id="raytrace" type="text/x-opencl">
+
+			typedef struct ray_struct{
+				float3 origin;
+				float3 direction;
+				float tmin;
+				float tmax;
+			} Ray;
+
+			typedef struct intersect_struct{
+				int i;
+				float t;
+				float a; 
+				float b;
+				float c;
+			} intersection;
+
+			float random(unsigned int *seed0, unsigned int *seed1) 
+			{
+				*seed0 = 36969 * ((*seed0) & 65535) + ((*seed0) >> 16);
+				*seed1 = 18000 * ((*seed1) & 65535) + ((*seed1) >> 16);
+
+				unsigned int ires = ((*seed0) << 16) + (*seed1);
+
+				//Convert to float
+				union {
+					float f;
+					unsigned int ui;
+				} res;
+				res.ui = (ires & 0x007fffff) | 0x40000000;
+
+				return (res.f - 2.) / 2.;
+			}
+
+
+			Ray reflectionRay(float3 normal, Ray ray, float3 point){
+				Ray newRay;
+
+				normal = normalize(normal);
+				ray.direction = normalize(ray.direction);
+
+				newRay.origin = point;
+				newRay.direction = ray.direction - ((float)2 * normal * dot(normal, ray.direction));
+
+				return newRay;
+			}
+
+			intersection ray_triangle_intersect(Ray ray, float3 p0, float3 p1, float3 p2, int i){
+				float t = INFINITY;
+				intersection tmin;
+				tmin.t = INFINITY;
+				tmin.i = -1;
+				
+
+				float3 p2p0 = (float3)(p2-p0);
+				float3 p1p0 = (float3)(p1-p0);
+
+				float3 normal = cross(p1p0, p2p0);
+				if(dot(normal, ray.direction) != 0.){
+					t = dot(normal, p0 - ray.origin) / dot(normal, ray.direction);
+					if(t > 0.00001){
+						float3 point = ray.origin + (t * ray.direction);
+						float a = dot(cross(point - p0, p2p0), normal)/(dot(normal,normal));
+						if(a > 0.){
+							float b = dot(cross(p1p0, point-p0), normal)/(dot(normal,normal));
+								if(b >=0. && a+b <= 1.){
+								
+									if(tmin.t > t){
+										tmin.t = t;
+										tmin.i = i;
+										tmin.a = a;
+										tmin.b = b;
+										tmin.c = 1 - a -b;
+									}
+									
+								}
+						}
+					}
+				}
+					
+
+				
+
+				return tmin;
+			}
+
+			float3 rayPoint(Ray ray, float t){
+				return  (ray.origin + (t * ray.direction));
+			}
+
+			
+			intersection getRayIntersection(Ray ray, __global const float *triangleData, int nTriangles){
+				intersection t;
+				t.t = INFINITY;
+				t.i = -1;
+				
+				//loop through triangle data by the indexes given through the cell buffer
+				for (int j = 0; j < nTriangles; j++){
+
+						float3 p0 = (float3)(triangleData[(19*j)+0],triangleData[(19*j)+1],triangleData[(19*j)+2]);
+						float3 p1 = (float3)(triangleData[(19*j)+3],triangleData[(19*j)+4],triangleData[(19*j)+5]);
+						float3 p2 = (float3)(triangleData[(19*j)+6],triangleData[(19*j)+7],triangleData[(19*j)+8]);
+						intersection ttemp = ray_triangle_intersect(ray, p0, p1, p2, j);
+						if(ttemp.t < t.t && ttemp.t > 0.0001){
+							t = ttemp;
+						}
+				}
+
+				return t;
+			}
+
+			Ray sampleHemisphere(__global unsigned int *seedBuffer, int pixelId, float3 center, float3 n, float3 perp){
+				Ray ray;
+				ray.origin = center;
+
+				uint seed0 = seedBuffer[2*pixelId];
+				uint seed1 = seedBuffer[2*pixelId+1];
+
+				
+				float zd = random(&seed0, &seed1);
+
+				seedBuffer[2*pixelId] = seed0;
+				seedBuffer[2*pixelId+1] = seed1;
+
+				float phi = M_PI*2.f*random(&seed0, &seed1);
+
+				seedBuffer[2*pixelId] = seed0;
+				seedBuffer[2*pixelId+1] = seed1;
+
+				float r = sqrt(1-pow(zd, 2.f));
+				float xd = r* cos(phi);
+				float yd = r*sin(phi);
+
+				n = normalize(n);
+				float3 temp = n;
+				if (fabs(n.x) < fabs(n.y) && fabs(n.x) < fabs(n.z))
+					temp.x=1;
+				else if (fabs(n.y) < fabs(n.x) && fabs(n.y) < fabs(n.z))
+					temp.y=1;
+				else 
+					temp.z=1;
+				
+				float3 u = normalize(cross(n, perp));
+				float3 v = cross(n,u);
+				float3 w = n;
+
+
+				ray.direction = (xd*u)+(yd*v)+(zd*w);
+				//ray.direction = (float3)(xd,yd,zd);
+				return ray;
+			}
+
+			int shadowRay(float3 point, float3 light, int nTriangles, __global const float *triangleData){
+
+				Ray ray;
+				ray.origin = point;
+				ray.direction = light-point;
+				float t=-1;
+
+				for (int i = 0; i< nTriangles; i++){
+					float3 p0 = (float3)(triangleData[(19*i)+0],triangleData[(19*i)+1],triangleData[(19*i)+2]);
+					float3 p1 = (float3)(triangleData[(19*i)+3],triangleData[(19*i)+4],triangleData[(19*i)+5]);
+					float3 p2 = (float3)(triangleData[(19*i)+6],triangleData[(19*i)+7],triangleData[(19*i)+8]);
+
+					float3 p2p0 = (float3)(p2-p0);
+					float3 p1p0 = (float3)(p1-p0);
+
+					float3 normal = cross(p1p0, p2p0);
+					if(dot(normal, ray.direction) != 0.){
+						t = dot(normal, p0 - ray.origin) / dot(normal, ray.direction);
+						if(t > 0.){
+							float3 point = ray.origin + (t * ray.direction);
+							float a = dot(cross(point - p0, p2p0), normal)/(dot(normal,normal));
+							if(a > 0.00001){
+								float b = dot(cross(p1p0, point-p0), normal)/(dot(normal,normal));
+									if(b >=0. && a+b <= 1.){
+										
+										if(t <= 1. && t > .001){
+											return 0;
+										}
+										
+									}
+							}
+						}
+					}
+				}
+
+				return 1;
+			}
+
+			Ray refractionRay(Ray ray, float3 point, float3 normal, float n1, float n2){
+				
+				float n = n1/n2;
+				float cosI = -dot(normal, -normalize(ray.direction));
+				float sinT = n*n*(1.0-cosI*cosI);
+				float cosT = sqrt(1.0-sinT);				
+				Ray refl;
+				refl.origin = point;
+				refl.direction = (n*normalize(ray.direction)) + ((n*cosI-cosT)*normal);
+				
+				return refl;
+
+			}
+
+			float3 getColor(Ray ray, 
+				__global const float *triangleData,
+				int nTriangles,
+				int nMaterials,
+				__global const float *materialData,
+				float3 light, 
+				float area,
+				float3 emission, 
+				__global unsigned int *seedBuffer,
+				int pixelId,
+				__global const float *photonBuffer, 
+				int nPhotons,
+				float rad,
+				int renderPhotonMap
+				)
+			{
+
+				float3 color = (float3)(0,0,0);
+				float3 attenuation = (float3)(1,1,1);
+				
+				float3 lightnorm = (float3)(0.,-1.,0.);
+
+				intersection t;
+				intersection t2;
+
+				float3 dir = (float3)(0,0,0);
+				float3 indir;
+				float3 kdiff;
+				//float rad = .005;
+				//float rad = 2.25;
+				//float rad = .1;
+				if(renderPhotonMap == 1){rad = .005;}
+				Ray eye = ray;
+
+				for(int i = 0; i < ((renderPhotonMap == 1)?1:2); i++){
+					
+					//intersect ray with scene
+					t = getRayIntersection(ray, triangleData, nTriangles);
+
+						if(t.t < INFINITY){
+
+
+
+							float3 n0 = (float3)(triangleData[(19*t.i)+9],triangleData[(19*t.i)+10],triangleData[(19*t.i)+11]);
+							float3 n1 = (float3)(triangleData[(19*t.i)+12],triangleData[(19*t.i)+13],triangleData[(19*t.i)+14]);
+							float3 n2 = (float3)(triangleData[(19*t.i)+15],triangleData[(19*t.i)+16],triangleData[(19*t.i)+17]);
+							//get normal
+							float3 interpolatedNormal = (float3)((t.a*n1)+(t.b*n2)+(t.c*n0));
+							interpolatedNormal = normalize(interpolatedNormal);
+							//get reflection data
+							int matIndex = triangleData[(19*t.i)+18];									
+							float3 point = ray.origin + (t.t * ray.direction);
+							float3 kdiff = (float3)(materialData[(matIndex*9)], materialData[(matIndex*9)+1], materialData[(matIndex*9)+2]);
+
+							if(renderPhotonMap != 1){
+								while(kdiff.x < .001 && kdiff.y < .001 && kdiff.z < .001){
+															
+									ray = refractionRay(ray, point, interpolatedNormal, 1.0, 1.55);
+									t = getRayIntersection(ray, triangleData, nTriangles);
+									if(t.i == -1){break;}
+	
+										n0 = (float3)(triangleData[(19*t.i)+9],triangleData[(19*t.i)+10],triangleData[(19*t.i)+11]);
+										n1 = (float3)(triangleData[(19*t.i)+12],triangleData[(19*t.i)+13],triangleData[(19*t.i)+14]);
+										n2 = (float3)(triangleData[(19*t.i)+15],triangleData[(19*t.i)+16],triangleData[(19*t.i)+17]);
+										//get normal
+										interpolatedNormal = (float3)((t.a*n1)+(t.b*n2)+(t.c*n0));
+										interpolatedNormal = normalize(interpolatedNormal);
+										//get reflection data
+										matIndex = triangleData[(19*t.i)+18];									
+										point = ray.origin + (t.t * ray.direction);
+										kdiff = (float3)(materialData[(matIndex*9)], materialData[(matIndex*9)+1], materialData[(matIndex*9)+2]);
+									
+								}
+							}
+
+
+							attenuation = (float3)(attenuation.x*kdiff.x, attenuation.y*kdiff.y, attenuation.z*kdiff.z);
+							for(int j = 0; j<nPhotons*9; j+=9){
+								float3 photonPos = (float3)(photonBuffer[j],photonBuffer[j+1],photonBuffer[j+2]);
+								
+								if(length(point-photonPos) <= rad){
+									float cosCheck = max(dot(interpolatedNormal, -normalize((float3)(photonBuffer[j+3], photonBuffer[j+4], photonBuffer[j+5]))),0.f);
+									if(cosCheck > 0.001)
+										color += (float3)((attenuation.x/(pow(3.14,2.0)*rad*rad))*photonBuffer[j+6], (attenuation.y/(pow(3.14,2.0)*rad*rad))*photonBuffer[j+7], (attenuation.z/(pow(3.14,2.0)*rad*rad))*photonBuffer[j+8]);
+
+								}
+
+							}
+							
+							if(renderPhotonMap != 1){
+								if(shadowRay(point, light, nTriangles, triangleData) && i < 3){
+									
+									emission = (float3)(17,12,4);
+									float cosine = max(dot(normalize(light-point),normalize(interpolatedNormal)), 0.f);
+									float floatpart = (4*area/M_PI)*(cosine*(max(dot(normalize(lightnorm), normalize(point-light)), 0.f))/ pow(length(light-point),2.f));
+									float3 directlight = emission*floatpart;								
+									float3 emitter = (float3)(materialData[(matIndex*9)+6], materialData[(matIndex*9)+7], materialData[(matIndex*9)+8]);
+									if(i<1)directlight += emitter;
+									color += (float3)(directlight.x*attenuation.x,directlight.y*attenuation.y,directlight.z*attenuation.z);
+
+								}
+
+								float3 p0 = (float3)(triangleData[(19*i)+0],triangleData[(19*i)+1],triangleData[(19*i)+2]);
+								float3 p1 = (float3)(triangleData[(19*i)+3],triangleData[(19*i)+4],triangleData[(19*i)+5]);
+								float3 perp = (float3)(normalize(p1-p0));
+								ray = sampleHemisphere(seedBuffer, pixelId, point, interpolatedNormal, perp);
+
+							}
+
+							
+						}	
+					
+				}
+
+				return color;
+
+			}
+
+
+			__kernel void raytrace(
+				__global float4* pixels,
+				__global const float *camera,
+				__global const float *triangleData,
+				int nTriangles,
+				int rows, 
+				int cols,
+				int nMaterials,
+				__global const float *materialData,
+				__global const float *lightBuffer,
+				__global unsigned int *seedBuffer,
+				__global uchar4* canvas,
+				int iterations,
+				__global const float *photonBuffer,
+				int nPhotons,	
+				float radius, 
+				int renderPhotonMap
+				) 
+			{
+
+				int col = get_global_id(0);
+				int row = get_global_id(1);
+				
+				if(col >= cols || row >= rows) return;
+
+				int pixelId = row*cols+col;
+				uint seed0 = seedBuffer[2*pixelId];
+				uint seed1 = seedBuffer[2*pixelId+1];
+
+				
+				float sx = random(&seed0,&seed1);
+				float sy = random(&seed0,&seed1);
+
+				float dx = lightBuffer[2] - lightBuffer[0];
+				float dz = lightBuffer[3] - lightBuffer[1];
+				float3 lightsample = (float3)((sx*dx)+lightBuffer[0], 1.9799, (sy*dz)+lightBuffer[1]);
+				//float3 lightsample = (float3)(0, 1.9,0);
+
+				//After random calls are made then you write back 
+				seedBuffer[2*pixelId] = seed0;
+				seedBuffer[2*pixelId+1] = seed1;
+
+				float3 w = normalize((float3)(camera[0]-camera[3], camera[1]-camera[4], camera[2]-camera[5]));
+				float3 u = normalize(cross((float3)(camera[6],camera[7],camera[8]),w));
+				float3 v = normalize(cross(w,u));
+
+				
+				float aspect = (float)cols/(float)(rows);
+				float height = 2.0 * tan(camera[9]/2.0);
+				float width = height * aspect;
+				float pixSize = height/(float)rows;
+
+				
+				float part1f = (-.5 + (((float)col+.5)/cols)) * .5;
+				float3 part2 =  part1f * u;
+				float part2f = (.5 - (((float)row+.5)/rows)) * .5;
+				float3 part3 = part2f * v;
+				
+				float3 dir = -w + part2 + part3;
+				
+				Ray ray;
+				ray.direction = dir;
+				ray.origin = (float3)(camera[0], camera[1], camera[2]);
+
+				float3 color = (float3)(0,0,0);
+				float3 emission = (float3)(lightBuffer[6],lightBuffer[7], lightBuffer[8]);
+				color = getColor(ray, triangleData, nTriangles, nMaterials, materialData, lightsample, lightBuffer[5], emission, seedBuffer, pixelId, photonBuffer, nPhotons, radius, renderPhotonMap);
+				
+				pixels[row*cols+col] += (float4)(color.x,color.y,color.z,1);
+				//canvas[row*cols+col] = (uchar4)(255*pixels[row*cols+col].x/iterations,255*pixels[row*cols+col].y/iterations,255*pixels[row*cols+col].z/iterations,255);
+				canvas[row*cols+col] = (uchar4)(min((int)(255*pixels[row*cols+col].x/iterations), 255), min((int)(255*pixels[row*cols+col].y/iterations),255),min((int)(255*pixels[row*cols+col].z/iterations),255),255);
+			}
+
+		</script>
+		<script id="photontrace" type="text/x-opencl">
+
+			typedef struct ray_struct{
+				float3 origin;
+				float3 direction;
+				float tmin;
+				float tmax;
+			} Ray;
+
+			typedef struct intersect_struct{
+				int i;
+				float t;
+				float a; 
+				float b;
+				float c;
+			} intersection;
+
+			float random(unsigned int *seed0, unsigned int *seed1) 
+			{
+				*seed0 = 36969 * ((*seed0) & 65535) + ((*seed0) >> 16);
+				*seed1 = 18000 * ((*seed1) & 65535) + ((*seed1) >> 16);
+
+				unsigned int ires = ((*seed0) << 16) + (*seed1);
+
+				//Convert to float
+				union {
+					float f;
+					unsigned int ui;
+				} res;
+				res.ui = (ires & 0x007fffff) | 0x40000000;
+
+				return (res.f - 2.) / 2.;
+			}
+
+			intersection ray_triangle_intersect(Ray ray, float3 p0, float3 p1, float3 p2, int i){
+				float t = INFINITY;
+				intersection tmin;
+				tmin.t = INFINITY;
+				tmin.i = -1;
+				
+
+				float3 p2p0 = (float3)(p2-p0);
+				float3 p1p0 = (float3)(p1-p0);
+
+				float3 normal = cross(p1p0, p2p0);
+				if(dot(normal, ray.direction) != 0.){
+					t = dot(normal, p0 - ray.origin) / dot(normal, ray.direction);
+					if(t > 0.00001){
+						float3 point = ray.origin + (t * ray.direction);
+						float a = dot(cross(point - p0, p2p0), normal)/(dot(normal,normal));
+						if(a > 0.){
+							float b = dot(cross(p1p0, point-p0), normal)/(dot(normal,normal));
+								if(b >=0. && a+b <= 1.){
+								
+									if(tmin.t > t){
+										tmin.t = t;
+										tmin.i = i;
+										tmin.a = a;
+										tmin.b = b;
+										tmin.c = 1 - a -b;
+									}
+									
+								}
+						}
+					}
+				}
+					
+
+				
+
+				return tmin;
+			}
+
+			float3 rayPoint(Ray ray, float t){
+				return  (ray.origin + (t * ray.direction));
+			}
+
+			intersection getRayIntersection(Ray ray, __global const float *triangleData, int nTriangles){
+				intersection t;
+				t.t = INFINITY;
+				t.i = -1;
+				
+				//loop through triangle data by the indexes given through the cell buffer
+				for (int j = 0; j < nTriangles; j++){
+
+						float3 p0 = (float3)(triangleData[(19*j)+0],triangleData[(19*j)+1],triangleData[(19*j)+2]);
+						float3 p1 = (float3)(triangleData[(19*j)+3],triangleData[(19*j)+4],triangleData[(19*j)+5]);
+						float3 p2 = (float3)(triangleData[(19*j)+6],triangleData[(19*j)+7],triangleData[(19*j)+8]);
+						intersection ttemp = ray_triangle_intersect(ray, p0, p1, p2, j);
+						if(ttemp.t < t.t && ttemp.t > 0.0001){
+							t = ttemp;
+						}
+				}
+
+				return t;
+			}
+
+			Ray sampleHemisphere(__global unsigned int *seedBuffer, int photon, float3 center, float3 n, float3 perp){
+				Ray ray;
+				ray.origin = center;
+
+				uint seed0 = seedBuffer[2*photon];
+				uint seed1 = seedBuffer[2*photon+1];
+
+				
+				float zd = random(&seed0, &seed1);
+
+				seedBuffer[2*photon] = seed0;
+				seedBuffer[2*photon+1] = seed1;
+
+				float phi = M_PI*2.f*random(&seed0, &seed1);
+
+				seedBuffer[2*photon] = seed0;
+				seedBuffer[2*photon+1] = seed1;
+
+				float r = sqrt(1-pow(zd, 2.f));
+				float xd = r* cos(phi);
+				float yd = r*sin(phi);
+
+				n = normalize(n);
+				float3 temp = n;
+				if (fabs(n.x) < fabs(n.y) && fabs(n.x) < fabs(n.z))
+					temp.x=1;
+				else if (fabs(n.y) < fabs(n.x) && fabs(n.y) < fabs(n.z))
+					temp.y=1;
+				else 
+					temp.z=1;
+				
+				float3 u = normalize(cross(n, perp));
+				float3 v = cross(n,u);
+				float3 w = n;
+
+
+				ray.direction = (xd*u)+(yd*v)+(zd*w);
+				//ray.direction = (float3)(xd,yd,zd);
+				return ray;
+			}
+
+			Ray refractionRay(Ray ray, float3 point, float3 normal, float n1, float n2){
+				
+				float n = n1/n2;
+				float cosI = -dot(normal, -normalize(ray.direction));
+				float sinT = n*n*(1.0-cosI*cosI);
+				float cosT = sqrt(1.0-sinT);				
+				Ray refl;
+				refl.origin = point;
+				refl.direction = (n*normalize(ray.direction)) + ((n*cosI-cosT)*normal);
+				
+				return refl;
+
+			}
+
+			__kernel void photontrace(				
+				__global float *photonBuffer,
+				__global const float *triangleData,
+				int nTriangles,
+				int nPhotons, 
+				int nMaterials,
+				__global const float *materialData,
+				__global const float *lightBuffer,
+				__global unsigned int *seedBuffer
+				) 
+			{
+
+				int photon = get_global_id(0);				
+				
+				if(photon >= nPhotons) return;
+					
+
+				uint seed0 = seedBuffer[2*photon];
+				uint seed1 = seedBuffer[2*photon+1];
+
+				
+				float sx = random(&seed0,&seed1);
+				float sy = random(&seed0,&seed1);
+
+				float dx = lightBuffer[2] - lightBuffer[0];
+				float dz = lightBuffer[3] - lightBuffer[1];
+				float3 lightsample = (float3)((sx*dx)+lightBuffer[0], 1.9, (sy*dz)+lightBuffer[1]);
+				//float3 lightsample = (float3)(0, 1.9,0);
+
+
+				//After random calls are made then you write back 
+				seedBuffer[2*photon] = seed0;
+				seedBuffer[2*photon+1] = seed1;
+				float3 emission = (float3)(lightBuffer[6]/nPhotons,lightBuffer[7]/nPhotons, lightBuffer[8]/nPhotons);	
+				float3 perp = (float3)(1,0,0);
+				float3 interpolatedNormal = (float3)(0,-1,0);			
+				Ray ray = sampleHemisphere(seedBuffer, photon, lightsample, (float3)(0,-1,0), (float3)(1,0,0));
+				float3 point = lightsample;
+				float3 normal = (float3)(0,-1,0);
+				for(int i =0; i<5;i++){
+					intersection t = getRayIntersection(ray, triangleData, nTriangles);
+					//try to get a hemisphere sample that works
+					//int loops = 5;
+					//while(t.i == -1 && loops < 5){
+							ray = sampleHemisphere(seedBuffer,photon, point, interpolatedNormal, perp);
+							t = getRayIntersection(ray, triangleData, nTriangles);							
+					//		loops++;
+					//	}
+						if(t.i == -1){break;}
+					float3 point = rayPoint(ray, t.t);
+					float3 n0 = (float3)(triangleData[(19*t.i)+9],triangleData[(19*t.i)+10],triangleData[(19*t.i)+11]);
+					float3 n1 = (float3)(triangleData[(19*t.i)+12],triangleData[(19*t.i)+13],triangleData[(19*t.i)+14]);
+					float3 n2 = (float3)(triangleData[(19*t.i)+15],triangleData[(19*t.i)+16],triangleData[(19*t.i)+17]);
+					//get normal
+					interpolatedNormal = (float3)((t.a*n1)+(t.b*n2)+(t.c*n0));
+					interpolatedNormal = normalize(interpolatedNormal);
+					//get reflection data
+					int matIndex = triangleData[(19*t.i)+18];									
+
+					float3 kdiff = (float3)(materialData[(matIndex*9)], materialData[(matIndex*9)+1], materialData[(matIndex*9)+2]);
+
+					uint count = 0;
+						while(kdiff.x < .000001 && kdiff.y < .000001 && kdiff.z < .000001 && count < 3 ){
+
+							ray = refractionRay(ray, point, interpolatedNormal, 1.0, 1.55);
+							t = getRayIntersection(ray, triangleData, nTriangles);
+							if(t.i == -1){break;}
+							point = rayPoint(ray, t.t);
+							n0 = (float3)(triangleData[(19*t.i)+9],triangleData[(19*t.i)+10],triangleData[(19*t.i)+11]);
+							n1 = (float3)(triangleData[(19*t.i)+12],triangleData[(19*t.i)+13],triangleData[(19*t.i)+14]);
+							n2 = (float3)(triangleData[(19*t.i)+15],triangleData[(19*t.i)+16],triangleData[(19*t.i)+17]);
+							//get normal
+							interpolatedNormal = (float3)((t.a*n1)+(t.b*n2)+(t.c*n0));
+							interpolatedNormal = normalize(interpolatedNormal);
+							//get reflection data
+							matIndex = triangleData[(19*t.i)+18];									
+
+							kdiff = (float3)(materialData[(matIndex*9)], materialData[(matIndex*9)+1], materialData[(matIndex*9)+2]);
+							count++;
+						}
+						if(t.i == -1){break;}
+						float scale = dot(normalize(ray.direction), normal);
+						normal = interpolatedNormal;
+						if(kdiff.x > .000001 && kdiff.y > .000001 && kdiff.z > .000001){
+						//if(i > 1){
+							emission = scale*emission;
+							photonBuffer[(photon*45) + (9*i) + 0] = point.x;
+							photonBuffer[(photon*45) + (9*i) + 1] = point.y;
+							photonBuffer[(photon*45) + (9*i) + 2] = point.z;
+							photonBuffer[(photon*45) + (9*i) + 3] = ray.direction.x;
+							photonBuffer[(photon*45) + (9*i) + 4] = ray.direction.y;
+							photonBuffer[(photon*45) + (9*i) + 5] = ray.direction.z;
+							photonBuffer[(photon*45) + (9*i) + 6] = emission.x;
+							photonBuffer[(photon*45) + (9*i) + 7] = emission.y;
+							photonBuffer[(photon*45) + (9*i) + 8] = emission.z;
+
+							float powerMag = sqrt(emission.x*emission.x+emission.y*emission.y+emission.z*emission.z);
+							float3 powerRef = normalize((float3)(emission.x*kdiff.x, emission.y*kdiff.y, emission.z*kdiff.z));
+							
+							emission = (float3)(powerRef.x*powerMag, powerRef.y*powerMag, powerRef.z*powerMag);
+						}
+						if(max(max(kdiff.x, kdiff.y), kdiff.z) < random(&seed0,&seed1)){break;};
+						float3 p0 = (float3)(triangleData[(19*t.i)+0],triangleData[(19*t.i)+1],triangleData[(19*t.i)+2]);
+						float3 p1 = (float3)(triangleData[(19*t.i)+3],triangleData[(19*t.i)+4],triangleData[(19*t.i)+5]);
+						perp = normalize(p0-p1);
+						ray = sampleHemisphere(seedBuffer,photon, point, interpolatedNormal, perp);
+
+					
+				}
+			}
+		</script>  
+		<div id="container" style = "width:1400px">
+			<div id="title" style ="background-color:#FFFFFF;height:75px;width:1300px;text-align:left;">
+				<h1>Joseph Sarabia Project</h1>
+			</div>
+			<div id="window" style ="background-color:#FFFFFF;height:800px;width:850px;float:left;">
+				<canvas id="canvas" width="512px" height="512px" style="border:5px solid #000000; background: blue"></canvas><br> <button type="button" id="button" onclick="switchstuff()">Switch Scene</button>
+				<br>Photon Neighborhood Radius: .1<input type="range" id="PNRadius" onchange="radiusHandler()" min="1" max="20" value="1">2
+				<br>Photons: 0<input type="range" id="samples" onchange="sampleHandler()" min="1" max="100000" value="1000">100k
+				<br>Path Tracing Iterations: 1<input type="range" id="iterations" onchange="iterationHandler()" min="1" max="40" value="1">40
+				<br> <button type="button" id="map" onclick="mapHandler()">Toggle Photon Map</button>
+			</div>		
+			<div id="options" style="background-color:#FFFFFF;height:700px;width:515px;float:left;">			 
+			</div>
+
+		</div>
+		
+	</body>
+</html>
